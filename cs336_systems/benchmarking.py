@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from contextlib import nullcontext
 import json
 import statistics
@@ -10,8 +11,9 @@ from typing import Any
 
 import torch
 
+import cs336_basics.model as basics_model
 from cs336_basics.model import BasicsTransformerLM
-from cs336_basics.nn_utils import cross_entropy
+from cs336_basics.nn_utils import cross_entropy, softmax
 from cs336_basics.optimizer import AdamW
 from cs336_systems.model_configs import DEFAULT_BATCH_SIZE, DEFAULT_CONTEXT_LENGTH, DEFAULT_VOCAB_SIZE, MODEL_CONFIGS
 
@@ -54,7 +56,7 @@ def resolve_model_config(
     return config
 
 
-def synchronize_if_needed(device: torch.device) -> None:
+def synchronize(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
 
@@ -65,8 +67,51 @@ def nvtx_range(name: str, device: torch.device):
     return torch.cuda.nvtx.range(name)
 
 
+def annotated_scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    device = Q.device
+    d_k = K.shape[-1]
+
+    with nvtx_range("scaled dot product attention", device):
+        with nvtx_range("computing attention scores", device):
+            attention_scores = torch.einsum("...qd,...kd->...qk", Q, K) / math.sqrt(d_k)
+            if mask is not None:
+                attention_scores = torch.where(mask, attention_scores, float("-inf"))
+
+        with nvtx_range("computing softmax", device):
+            attention_weights = softmax(attention_scores, dim=-1)
+
+        with nvtx_range("final matmul", device):
+            return torch.einsum("...qk,...kd->...qd", attention_weights, V)
+
+
+def run_step(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    mode: BenchmarkMode,
+) -> None:
+    device = inputs.device
+
+    if mode == BenchmarkMode.FORWARD:
+        with torch.no_grad(), nvtx_range("forward", device):
+            model(inputs)
+        return
+
+    optimizer.zero_grad(set_to_none=True)
+    with nvtx_range("forward", device):
+        logits = model(inputs)
+
+    loss = cross_entropy(logits, targets)
+    with nvtx_range("backward", device):
+        loss.backward()
+
+    if mode == BenchmarkMode.TRAIN_STEP:
+        with nvtx_range("optimizer_step", device):
+            optimizer.step()
+
+
 def benchmark_steps(
-    *,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     inputs: torch.Tensor,
@@ -77,36 +122,18 @@ def benchmark_steps(
 ) -> dict[str, Any]:
     device = inputs.device
 
-    def forward() -> torch.Tensor:
-        with nvtx_range("forward", device):
-            return model(inputs)
-
-    def step() -> None:
-        if mode == BenchmarkMode.FORWARD:
-            with torch.no_grad():
-                forward()
-            return
-
-        optimizer.zero_grad(set_to_none=True)
-        logits = forward()
-        loss = cross_entropy(logits, targets)
-        with nvtx_range("backward", device):
-            loss.backward()
-
-        if mode == BenchmarkMode.TRAIN_STEP:
-            with nvtx_range("optimizer_step", device):
-                optimizer.step()
-
-    for _ in range(warmup_steps):
-        step()
-        synchronize_if_needed(device)
+    with nvtx_range("warmup", device):
+        for _ in range(warmup_steps):
+            run_step(model, optimizer, inputs, targets, mode)
+            synchronize(device)
 
     timings = []
-    for _ in range(measurement_steps):
-        start = timeit.default_timer()
-        step()
-        synchronize_if_needed(device)
-        timings.append(timeit.default_timer() - start)
+    with nvtx_range("measurement", device):
+        for _ in range(measurement_steps):
+            start = timeit.default_timer()
+            run_step(model, optimizer, inputs, targets, mode)
+            synchronize(device)
+            timings.append(timeit.default_timer() - start)
 
     return {
         "mode": mode.value,
@@ -133,12 +160,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--measurement-steps", type=int, default=10)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--annotate-attention", action="store_true", help="Add NVTX ranges inside scaled dot-product attention for Nsight profiling.")
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     torch.manual_seed(args.seed)
+
+    if args.annotate_attention:
+        basics_model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
 
     device = torch.device(args.device)
     config = resolve_model_config(
@@ -156,15 +187,7 @@ def main(argv: list[str] | None = None) -> None:
     inputs = torch.randint(0, config["vocab_size"], (args.batch_size, config["context_length"]), device=device)
     targets = torch.randint(0, config["vocab_size"], (args.batch_size, config["context_length"]), device=device)
 
-    results = benchmark_steps(
-        model=model,
-        optimizer=optimizer,
-        inputs=inputs,
-        targets=targets,
-        mode=BenchmarkMode(args.mode),
-        warmup_steps=args.warmup_steps,
-        measurement_steps=args.measurement_steps,
-    )
+    results = benchmark_steps(model, optimizer, inputs, targets, BenchmarkMode(args.mode), args.warmup_steps, args.measurement_steps)
     results["model_config"] = config
     results["batch_size"] = args.batch_size
     results["device"] = str(device)
