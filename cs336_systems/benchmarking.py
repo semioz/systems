@@ -90,16 +90,18 @@ def run_step(
     inputs: torch.Tensor,
     targets: torch.Tensor,
     mode: BenchmarkMode,
+    mixed_precision: bool = False,
 ) -> None:
     device = inputs.device
+    precision_context = torch.autocast(device_type=device.type, dtype=torch.bfloat16) if mixed_precision else nullcontext()
 
     if mode == BenchmarkMode.FORWARD:
-        with torch.no_grad(), nvtx_range("forward", device):
+        with torch.no_grad(), nvtx_range("forward", device), precision_context:
             model(inputs)
         return
 
     optimizer.zero_grad(set_to_none=True)
-    with nvtx_range("forward", device):
+    with nvtx_range("forward", device), precision_context:
         logits = model(inputs)
 
     loss = cross_entropy(logits, targets)
@@ -119,24 +121,26 @@ def benchmark_steps(
     mode: BenchmarkMode,
     warmup_steps: int,
     measurement_steps: int,
+    mixed_precision: bool = False,
 ) -> dict[str, Any]:
     device = inputs.device
 
     with nvtx_range("warmup", device):
         for _ in range(warmup_steps):
-            run_step(model, optimizer, inputs, targets, mode)
+            run_step(model, optimizer, inputs, targets, mode, mixed_precision=mixed_precision)
             synchronize(device)
 
     timings = []
     with nvtx_range("measurement", device):
         for _ in range(measurement_steps):
             start = timeit.default_timer()
-            run_step(model, optimizer, inputs, targets, mode)
+            run_step(model, optimizer, inputs, targets, mode, mixed_precision=mixed_precision)
             synchronize(device)
             timings.append(timeit.default_timer() - start)
 
     return {
         "mode": mode.value,
+        "mixed_precision": mixed_precision,
         "warmup_steps": warmup_steps,
         "measurement_steps": measurement_steps,
         "mean_seconds": statistics.fmean(timings),
@@ -160,6 +164,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--measurement-steps", type=int, default=10)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--mixed-precision", action="store_true", help="Run model forward under BF16 autocast.")
     parser.add_argument("--annotate-attention", action="store_true", help="Add NVTX ranges inside scaled dot-product attention for Nsight profiling.")
     return parser
 
@@ -187,7 +192,7 @@ def main(argv: list[str] | None = None) -> None:
     inputs = torch.randint(0, config["vocab_size"], (args.batch_size, config["context_length"]), device=device)
     targets = torch.randint(0, config["vocab_size"], (args.batch_size, config["context_length"]), device=device)
 
-    results = benchmark_steps(model, optimizer, inputs, targets, BenchmarkMode(args.mode), args.warmup_steps, args.measurement_steps)
+    results = benchmark_steps(model, optimizer, inputs, targets, BenchmarkMode(args.mode), args.warmup_steps, args.measurement_steps, mixed_precision=args.mixed_precision)
     results["model_config"] = config
     results["batch_size"] = args.batch_size
     results["device"] = str(device)
