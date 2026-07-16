@@ -160,3 +160,122 @@ float32 += float16 cast to float32: tensor(10.0021) torch.float32
 Writeup draft:
 
 > The exact result should be 10.0. Accumulating entirely in FP32 gives 10.0001, while accumulating in FP16 gives 9.9531 because FP16 has much lower precision and repeatedly rounds the partial sum. Keeping the accumulator in FP32 improves stability, but when each added value is first represented as FP16 the quantization error of 0.01 remains, giving about 10.0021.
+
+### Problem (benchmarking_mixed_precision) part (a)
+
+Script:
+- `scripts/mixed_precision_toy_dtypes.py`
+
+Output on CUDA with `torch.autocast(device_type="cuda", dtype=torch.float16)`:
+
+```text
+parameters: torch.float32
+fc1 output: torch.float16
+layer norm output: torch.float32
+logits: torch.float16
+loss: torch.float16
+gradients: torch.float32
+```
+
+Writeup draft:
+
+| component | dtype |
+|---|---|
+| model parameters within autocast | `torch.float32` |
+| `ToyModel.fc1` output | `torch.float16` |
+| `ToyModel.ln` output | `torch.float32` |
+| logits | `torch.float16` |
+| loss | `torch.float16` |
+| gradients | `torch.float32` |
+
+Autocast does not change the model parameter dtype, so parameters remain FP32. Linear layers are autocast to FP16, while LayerNorm remains FP32 because normalization/reduction operations are numerically sensitive; gradients are FP32 because the original parameters are FP32.
+
+### Problem (benchmarking_mixed_precision) part (b)
+
+Writeup draft:
+
+> The sensitive parts of LayerNorm are the reductions used to compute the mean and variance, and the normalization division by `sqrt(var + eps)`. These operations accumulate many values and can involve small denominators, so FP16 rounding error or underflow/overflow can noticeably affect the result. BF16 has the same exponent range as FP32, so it is much less prone to FP16-style overflow/underflow, but its shorter mantissa means reductions can still lose precision; therefore keeping LayerNorm reductions in FP32 is still a safe default, though BF16 makes special handling less critical than FP16.
+
+### Problem (benchmarking_mixed_precision) part (c)
+
+Benchmarked on an NVIDIA A100 80GB PCIe with batch size 1 and context length 512.
+
+| model | forward FP32 (s) | forward BF16 (s) | forward+backward FP32 (s) | forward+backward BF16 (s) |
+|---|---:|---:|---:|---:|
+| small | 0.0136 | 0.0095 | 0.0445 | 0.0345 |
+| medium | 0.0395 | 0.0193 | 0.1268 | 0.0640 |
+| large | 0.0785 | 0.0305 | 0.2531 | 0.1023 |
+| xl | 0.2423 | 0.0610 | 0.7425 | 0.2052 |
+| 10B | 0.8753 | 0.1753 | OOM | OOM |
+
+Deliverable:
+
+> With BF16 mixed precision, forward time improved from 0.0136s to 0.0095s for small, 0.0395s to 0.0193s for medium, 0.0785s to 0.0305s for large, 0.2423s to 0.0610s for xl, and 0.8753s to 0.1753s for 10B. Forward+backward time improved from 0.0445s to 0.0345s for small, 0.1268s to 0.0640s for medium, 0.2531s to 0.1023s for large, and 0.7425s to 0.2052s for xl; the 10B forward+backward run OOMed in both FP32 and BF16 on this GPU. The speedup grows with model size because larger models spend more time in GEMM-heavy Transformer layers, where BF16 tensor-core kernels provide a larger benefit.
+
+## 2.1.6 Profiling Memory
+
+### Problem (memory_profiling) part (a)
+
+Added `--profile-memory`, `--memory-snapshot-path`, and `--memory-profile-max-entries` to `scripts/benchmark.py`. The profiler runs the normal benchmark setup, records CUDA memory history for one measured step, dumps a pickle snapshot, and stops memory-history recording.
+
+Forward pass, xl model, context length 2048:
+
+![xl ctx2048 forward active memory timeline](xl_ctx2048forwardprofile.png)
+
+In the forward-only memory timeline, memory stays near the model-parameter baseline of about 13 GiB. The small repeated spikes come from temporary attention and feed-forward activations inside each Transformer block, and they are freed after each layer because this run does not save activations for backward.
+
+Full training step, xl model, context length 2048:
+
+![xl ctx2048 train-step active memory timeline](xl_ctx2048trainprofile.png)
+
+In the full training-step timeline, memory rises steadily during the forward pass as activations are saved for backward, peaks around 65 GiB, and then decreases during backward as those saved tensors are freed. The final increase corresponds to gradients and AdamW optimizer state being materialized.
+
+Deliverable:
+
+> In the forward-only memory timeline, memory stays near the model-parameter baseline with small repeated spikes from temporary per-layer activations. In the full training-step timeline, memory rises during forward as activations are saved for backward, falls during backward as those tensors are freed, and rises again when gradients and AdamW optimizer state are materialized. Therefore the forward, backward, and optimizer stages are distinguishable from the shape of the memory timeline.
+
+### Problem (memory_profiling) part (b)
+
+Peak active CUDA memory for the xl model, batch size 1, FP32:
+
+| context length | forward peak memory | full train-step peak memory |
+|---:|---:|---:|
+| 128 | 12.8 GiB | 51.4 GiB |
+| 2048 | 14.9 GiB | 65.6 GiB |
+
+### Problem (memory_profiling) part (c)
+
+Peak active CUDA memory for the xl model with BF16 autocast, batch size 1:
+
+| context length | BF16 forward peak memory | BF16 full train-step peak memory |
+|---:|---:|---:|
+| 128 | 19.1 GiB | 51.4 GiB |
+| 2048 | 20.5 GiB | 57.1 GiB |
+
+Deliverable:
+
+> With BF16 autocast, the forward-only peak was 19.1 GiB at context length 128 and 20.5 GiB at context length 2048, which is higher than the FP32 forward-only peaks because autocast keeps FP32 parameters and may also cache lower-precision copies/workspaces. For the full training step, BF16 was essentially unchanged at context length 128 (51.4 GiB vs. 51.4 GiB FP32), but reduced the context length 2048 peak from 65.6 GiB to 57.1 GiB. Mixed precision therefore helps most when activation memory dominates; it does not reduce parameter, gradient, or AdamW optimizer-state memory because those remain FP32 in this setup.
+
+### Problem (memory_profiling) part (d)
+
+Deliverable:
+
+> For the xl model, a residual-stream activation tensor has shape `(batch_size, context_length, d_model) = (4, 512, 2560)` under the reference hyperparameters. In single precision this is `4 * 512 * 2560 * 4 = 20,971,520` bytes, or `20,971,520 / 1024^2 = 20 MiB`.
+
+### Problem (memory_profiling) part (e)
+
+Deliverable:
+
+> With the detail level reduced on the xl context length 2048 forward-pass snapshot, the largest visible allocations are 512 MiB each. The stack traces point to `scaled_dot_product_attention`, specifically the attention score/mask/softmax tensors; this matches the FP32 attention matrix size `(batch, heads, seq, seq) = (1, 32, 2048, 2048)`, which is `1 * 32 * 2048 * 2048 * 4 / 1024^2 = 512 MiB`.
+
+### Problem (memory_profiling) part (f)
+
+Nsight Systems profiles:
+- `nsys_memory_profiles/xl_ctx128_train_step_memory.nsys-rep`
+- `nsys_memory_profiles/xl_ctx2048_train_step_memory.nsys-rep`
+
+Note: the Nsight report captured CUDA memory usage and CUDA memory operations, but in this environment the NVTX rows were not displayed in the GUI despite tracing `nvtx`. I used the Nsight memory timeline for the CUDA memory view and the PyTorch memory snapshot stack traces to attribute the largest saved tensors to specific model operations.
+
+For the xl model at context length 2048, the active memory before the profiled training step was about 12.7 GiB and the post-forward peak was about 65.6 GiB. This means the forward pass saved about 52.96 GiB of tensors for backward across 32 Transformer blocks, or about 1.65 GiB per block. The five largest attributable contributors were attention score/softmax tensors from scaled dot-product attention (~1009 MiB per block, 59.5%), Linear/einsum projection outputs (~177 MiB, 10.4%), SwiGLU/SiLU intermediates (~155 MiB, 9.1%), the FFN elementwise product/input to `w2` (~77.5 MiB, 4.6%), and RoPE/RMSNorm/residual-stream tensors at about 40 MiB each (~2.3-2.4%).
+
+During backward, active memory dropped from about 65.6 GiB to about 25.4 GiB before the optimizer step, a net decrease of about 1288 MiB per block. Since each block had saved about 1695 MiB during forward, the gradient tensors produced during backward are approximately `1695 - 1288 = 407 MiB` per block. This matches the expected gradient memory: one xl Transformer block has roughly `4 * d_model^2 + 3 * d_model * d_ff = 104.9M` FP32 parameters, whose gradients take about `104.9M * 4 / 1024^2 ≈ 400 MiB`.
