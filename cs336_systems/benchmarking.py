@@ -7,6 +7,7 @@ import json
 import statistics
 import timeit
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -149,6 +150,50 @@ def benchmark_steps(
     }
 
 
+def profile_memory_step(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    mode: BenchmarkMode,
+    warmup_steps: int,
+    snapshot_path: str,
+    mixed_precision: bool = False,
+    max_entries: int = 1_000_000,
+) -> dict[str, Any]:
+    device = inputs.device
+    if device.type != "cuda":
+        raise ValueError("Memory profiling requires a CUDA device.")
+
+    for _ in range(warmup_steps):
+        run_step(model, optimizer, inputs, targets, mode, mixed_precision=mixed_precision)
+        synchronize(device)
+
+    snapshot = Path(snapshot_path)
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+
+    torch.cuda.memory._record_memory_history(max_entries=max_entries)
+    try:
+        start = timeit.default_timer()
+        run_step(model, optimizer, inputs, targets, mode, mixed_precision=mixed_precision)
+        synchronize(device)
+        elapsed = timeit.default_timer() - start
+        torch.cuda.memory._dump_snapshot(str(snapshot))
+    finally:
+        torch.cuda.memory._record_memory_history(enabled=None)
+
+    return {
+        "mode": mode.value,
+        "mixed_precision": mixed_precision,
+        "warmup_steps": warmup_steps,
+        "measurement_steps": 1,
+        "mean_seconds": elapsed,
+        "std_seconds": 0.0,
+        "timings_seconds": [elapsed],
+        "memory_snapshot_path": str(snapshot),
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Benchmark BasicsTransformerLM forward/backward/training steps.")
     parser.add_argument("--model-size", choices=tuple(MODEL_CONFIGS), default="small")
@@ -165,6 +210,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--mixed-precision", action="store_true", help="Run model forward under BF16 autocast.")
+    parser.add_argument("--profile-memory", action="store_true", help="Record CUDA memory history for one measured step and dump a memory snapshot.")
+    parser.add_argument("--memory-snapshot-path", default="memory_snapshot.pickle", help="Output path for PyTorch memory profiler snapshot.")
+    parser.add_argument("--memory-profile-max-entries", type=int, default=1_000_000, help="Maximum number of CUDA memory events to record.")
     parser.add_argument("--annotate-attention", action="store_true", help="Add NVTX ranges inside scaled dot-product attention for Nsight profiling.")
     return parser
 
@@ -192,7 +240,21 @@ def main(argv: list[str] | None = None) -> None:
     inputs = torch.randint(0, config["vocab_size"], (args.batch_size, config["context_length"]), device=device)
     targets = torch.randint(0, config["vocab_size"], (args.batch_size, config["context_length"]), device=device)
 
-    results = benchmark_steps(model, optimizer, inputs, targets, BenchmarkMode(args.mode), args.warmup_steps, args.measurement_steps, mixed_precision=args.mixed_precision)
+    mode = BenchmarkMode(args.mode)
+    if args.profile_memory:
+        results = profile_memory_step(
+            model,
+            optimizer,
+            inputs,
+            targets,
+            mode,
+            args.warmup_steps,
+            args.memory_snapshot_path,
+            mixed_precision=args.mixed_precision,
+            max_entries=args.memory_profile_max_entries,
+        )
+    else:
+        results = benchmark_steps(model, optimizer, inputs, targets, mode, args.warmup_steps, args.measurement_steps, mixed_precision=args.mixed_precision)
     results["model_config"] = config
     results["batch_size"] = args.batch_size
     results["device"] = str(device)
