@@ -11,12 +11,36 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from torch.utils.checkpoint import checkpoint
 
 import cs336_basics.model as basics_model
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.nn_utils import cross_entropy, softmax
 from cs336_basics.optimizer import AdamW
 from cs336_systems.model_configs import DEFAULT_BATCH_SIZE, DEFAULT_CONTEXT_LENGTH, DEFAULT_VOCAB_SIZE, MODEL_CONFIGS
+
+
+def apply_checkpointing(model: torch.nn.Module, chunk_size: int) -> None:
+    """Wrap consecutive TransformerBlocks in `torch.utils.checkpoint` groups of `chunk_size`."""
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be >= 1")
+
+    layers = model.layers
+    chunks = [layers[i : i + chunk_size] for i in range(0, len(layers), chunk_size)]
+
+    def run_chunk(x: torch.Tensor, chunk) -> torch.Tensor:
+        for layer in chunk:
+            x = layer(x)
+        return x
+
+    def checkpointed_forward(x: torch.Tensor) -> torch.Tensor:
+        x = model.token_embeddings(x)
+        for chunk in chunks:
+            x = checkpoint(run_chunk, x, chunk, use_reentrant=False)
+        x = model.ln_final(x)
+        return model.lm_head(x)
+
+    model.forward = checkpointed_forward
 
 
 class BenchmarkMode(StrEnum):
@@ -210,6 +234,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--mixed-precision", action="store_true", help="Run model forward under BF16 autocast.")
+    parser.add_argument("--checkpoint-chunk-size", type=int, default=0, help="Wrap consecutive TransformerBlocks in checkpoint groups of this size (0 disables checkpointing).")
     parser.add_argument("--profile-memory", action="store_true", help="Record CUDA memory history for one measured step and dump a memory snapshot.")
     parser.add_argument("--memory-snapshot-path", default="memory_snapshot.pickle", help="Output path for PyTorch memory profiler snapshot.")
     parser.add_argument("--memory-profile-max-entries", type=int, default=1_000_000, help="Maximum number of CUDA memory events to record.")
@@ -236,6 +261,8 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     model = BasicsTransformerLM(**config).to(device)
+    if args.checkpoint_chunk_size > 0:
+        apply_checkpointing(model, args.checkpoint_chunk_size)
     optimizer = AdamW(model.parameters())
     inputs = torch.randint(0, config["vocab_size"], (args.batch_size, config["context_length"]), device=device)
     targets = torch.randint(0, config["vocab_size"], (args.batch_size, config["context_length"]), device=device)
