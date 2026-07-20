@@ -279,3 +279,33 @@ Note: the Nsight report captured CUDA memory usage and CUDA memory operations, b
 For the xl model at context length 2048, the active memory before the profiled training step was about 12.7 GiB and the post-forward peak was about 65.6 GiB. This means the forward pass saved about 52.96 GiB of tensors for backward across 32 Transformer blocks, or about 1.65 GiB per block. The five largest attributable contributors were attention score/softmax tensors from scaled dot-product attention (~1009 MiB per block, 59.5%), Linear/einsum projection outputs (~177 MiB, 10.4%), SwiGLU/SiLU intermediates (~155 MiB, 9.1%), the FFN elementwise product/input to `w2` (~77.5 MiB, 4.6%), and RoPE/RMSNorm/residual-stream tensors at about 40 MiB each (~2.3-2.4%).
 
 During backward, active memory dropped from about 65.6 GiB to about 25.4 GiB before the optimizer step, a net decrease of about 1288 MiB per block. Since each block had saved about 1695 MiB during forward, the gradient tensors produced during backward are approximately `1695 - 1288 = 407 MiB` per block. This matches the expected gradient memory: one xl Transformer block has roughly `4 * d_model^2 + 3 * d_model * d_ff = 104.9M` FP32 parameters, whose gradients take about `104.9M * 4 / 1024^2 ≈ 400 MiB`.
+
+## 2.1.7 Gradient Checkpointing
+
+### Problem (gradient_checkpointing) part (a)
+
+Deliverable:
+
+> The memory-optimal strategy is recursive (nested) checkpointing with binary splitting: split the N blocks into two halves, wrap each half in `torch.utils.checkpoint.checkpoint`, and recurse until each leaf is a single block. During backward, at each level of the recursion PyTorch only needs to hold the input tensor to the sibling subtree (one activation-sized tensor), and the recomputation peak of the active subtree; one block's residuals dominate any per-checkpoint bookkeeping. This gives a recurrence `f(N) = 1 + f(N/2)` with `f(1) = 1`, so peak activation memory is `O(log N)` block-residual-equivalents. The compute cost is `O(N log N)`, since at each of the `log N` recursion levels the forward pass of the active subtree is recomputed once.
+>
+> ```python
+> from torch.utils.checkpoint import checkpoint
+>
+> def run_checkpointed(blocks, x):
+>     if len(blocks) == 1:
+>         return blocks[0](x)
+>     mid = len(blocks) // 2
+>     x = checkpoint(run_checkpointed, blocks[:mid], x, use_reentrant=False)
+>     x = checkpoint(run_checkpointed, blocks[mid:], x, use_reentrant=False)
+>     return x
+>
+> y = run_checkpointed(list_of_blocks, x)
+> ```
+
+### Problem (gradient_checkpointing) part (b)
+
+Deliverable:
+
+> With xl (N=32, d_model=2560, d_ff=10240, batch=4, ctx=2048), one block's saved residuals are about `3651 MiB`, while a single checkpoint's input tensor is `(4, 2048, 2560)` FP32 = `4 * 2048 * 2560 * 4 / 1024^2 = 80 MiB`. With only one level of checkpointing (one recomputation budget) and a chunk size of `c` consecutive blocks per checkpoint, peak activation memory is roughly `(N/c) * 80 MiB + c * 3651 MiB`; the first term is the checkpoint inputs held for all sibling chunks, the second is the recomputed residuals inside the single active chunk being backwarded. Minimizing over `c` gives `c* = sqrt(N * 80 / 3651) ≈ 0.84`, which rounds to `c = 1`, so the best one-recomputation-step strategy is to checkpoint every single TransformerBlock individually.
+>
+> Measured peak CUDA memory confirms this. In `train_step` mode (with AdamW state), `c=1` and `c=2` both peak at `51.69 GiB` because the ~26 GiB of AdamW state dominates and hides the activation difference, while `c=4` peaks at `56.10 GiB`. To isolate the effect of activation memory, I also ran the same experiments in `forward_backward` mode (no optimizer step, so no AdamW state is allocated): the peaks became `38.22 GiB` for `c=1`, `44.18 GiB` for `c=2`, and `56.10 GiB` for `c=4`, showing a clear staircase that matches the prediction — smaller checkpoint block sizes reduce peak activation memory, and the effect is visible once the dominating AdamW state is removed.
