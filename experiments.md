@@ -309,3 +309,98 @@ Deliverable:
 > With xl (N=32, d_model=2560, d_ff=10240, batch=4, ctx=2048), one block's saved residuals are about `3651 MiB`, while a single checkpoint's input tensor is `(4, 2048, 2560)` FP32 = `4 * 2048 * 2560 * 4 / 1024^2 = 80 MiB`. With only one level of checkpointing (one recomputation budget) and a chunk size of `c` consecutive blocks per checkpoint, peak activation memory is roughly `(N/c) * 80 MiB + c * 3651 MiB`; the first term is the checkpoint inputs held for all sibling chunks, the second is the recomputed residuals inside the single active chunk being backwarded. Minimizing over `c` gives `c* = sqrt(N * 80 / 3651) ≈ 0.84`, which rounds to `c = 1`, so the best one-recomputation-step strategy is to checkpoint every single TransformerBlock individually.
 >
 > Measured peak CUDA memory confirms this. In `train_step` mode (with AdamW state), `c=1` and `c=2` both peak at `51.69 GiB` because the ~26 GiB of AdamW state dominates and hides the activation difference, while `c=4` peaks at `56.10 GiB`. To isolate the effect of activation memory, I also ran the same experiments in `forward_backward` mode (no optimizer step, so no AdamW state is allocated): the peaks became `38.22 GiB` for `c=1`, `44.18 GiB` for `c=2`, and `56.10 GiB` for `c=4`, showing a clear staircase that matches the prediction — smaller checkpoint block sizes reduce peak activation memory, and the effect is visible once the dominating AdamW state is removed.
+
+## 4.1.1 Benchmarking PyTorch Attention
+
+### Problem (pytorch_attention)
+
+Setup:
+- GPU: Modal A100 80GB
+- Data type: FP32
+- Batch size: 8
+- Attention shape: `(batch, sequence_length, d_k)` with no head dimension
+- Warmup iterations: 5
+- Measured forward/backward iterations: 100 each
+- Synchronization: `torch.cuda.synchronize()` after every forward and backward pass
+- Script: `scripts/attention_benchmark.py`
+- Raw output: `attention_benchmark_results.txt`
+
+The reported times are means per pass, and memory is allocated CUDA memory immediately before backward begins.
+
+| d_k | sequence length | forward mean (ms) | backward mean (ms) | memory before backward (GiB) | status |
+|---:|---:|---:|---:|---:|:---|
+| 16 | 256 | 0.327 | 0.655 | 0.020 | OK |
+| 16 | 1024 | 0.618 | 1.573 | 0.081 | OK |
+| 16 | 4096 | 6.029 | 15.671 | 1.026 | OK |
+| 16 | 8192 | 22.385 | 57.242 | 4.036 | OK |
+| 16 | 16384 | 88.107 | 227.500 | 16.056 | OK |
+| 32 | 256 | 0.356 | 0.724 | 0.021 | OK |
+| 32 | 1024 | 0.573 | 1.455 | 0.083 | OK |
+| 32 | 4096 | 6.306 | 16.077 | 1.036 | OK |
+| 32 | 8192 | 23.320 | 58.186 | 4.056 | OK |
+| 32 | 16384 | 91.749 | 231.193 | 16.095 | OK |
+| 64 | 256 | 0.315 | 0.716 | 0.022 | OK |
+| 64 | 1024 | 0.607 | 1.478 | 0.088 | OK |
+| 64 | 4096 | 6.769 | 16.503 | 1.055 | OK |
+| 64 | 8192 | 25.109 | 59.990 | 4.095 | OK |
+| 64 | 16384 | 99.002 | 238.532 | 16.174 | OK |
+| 128 | 256 | 0.329 | 0.708 | 0.025 | OK |
+| 128 | 1024 | 0.660 | 1.543 | 0.098 | OK |
+| 128 | 4096 | 7.610 | 17.334 | 1.094 | OK |
+| 128 | 8192 | 28.592 | 63.579 | 4.173 | OK |
+| 128 | 16384 | 112.878 | 252.674 | 16.330 | OK |
+
+No configuration in the required grid ran out of memory on the A100 80GB, so there is no smallest measured OOM configuration. For memory accounting, consider the largest measured configuration, `B=8`, `S=16384`, and `d_k=128`. The two FP32 `(B, S, S)` tensors retained by the naive attention/softmax graph require
+
+`2 * B * S^2 * 4 = 2 * 8 * 16384^2 * 4 = 17,179,869,184 bytes = 16.000 GiB`.
+
+The five `(B, S, d_k)` tensors corresponding to `Q`, `K`, `V`, the output, and the output gradient require
+
+`5 * B * S * d_k * 4 = 5 * 8 * 16384 * 128 * 4 = 335,544,320 bytes = 0.3125 GiB`.
+
+Adding `1,572,864` bytes of row-wise softmax state and `17,039,360` bytes of fixed CUDA allocations gives
+
+`17,179,869,184 + 335,544,320 + 1,572,864 + 17,039,360 = 17,534,025,728 bytes = 16.330 GiB`,
+
+which exactly matches the measured memory before backward.
+
+Deliverable:
+
+> Forward time, backward time, and memory are dominated by the `S x S` attention matrices. Doubling sequence length from 4096 to 8192 increases measured memory from roughly 1 GiB to 4 GiB, and doubling it again to 16384 increases memory to roughly 16 GiB. Thus, tensors saved for backward grow as `O(BS^2)`, while changing `d_k` has a much smaller effect. Backward is consistently about 2-2.5 times slower than forward because it computes gradients for `Q`, `K`, and `V`. No required configuration OOMed on the A100 80GB.
+>
+> To eliminate the quadratic memory cost, I would use FlashAttention or PyTorch's fused `torch.nn.functional.scaled_dot_product_attention`. These implementations tile the computation and use online softmax instead of materializing the complete `S x S` attention matrix. This reduces activation memory from `O(BS^2)` to approximately `O(BSd_k)`, at the cost of recomputing small intermediate quantities during backward.
+
+## 4.2 Benchmarking JIT-Compiled Attention
+
+### Problem (torch_compile) part (a)
+
+Benchmarked on the same Modal A100 80GB configuration as the eager attention experiment. For each shape, the eager implementation and `torch.compile(scaled_dot_product_attention, fullgraph=True)` used identically seeded FP32 inputs, 5 warmup iterations, and 100 measured forward/backward iterations. The warmup includes forward and backward compilation, so compilation time is excluded from the reported means. Speedup is defined as `eager time / compiled time`; values greater than 1 mean compilation is faster.
+
+Raw output: `torch_compile_attention_results.txt`
+
+| d_k | sequence length | eager forward (ms) | compiled forward (ms) | forward speedup | eager backward (ms) | compiled backward (ms) | backward speedup |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 16 | 256 | 0.368 | 0.382 | 0.96x | 0.734 | 0.585 | 1.25x |
+| 16 | 1024 | 0.668 | 0.469 | 1.43x | 1.622 | 1.081 | 1.50x |
+| 16 | 4096 | 6.142 | 3.567 | 1.72x | 15.803 | 9.928 | 1.59x |
+| 16 | 8192 | 22.415 | 11.713 | 1.91x | 57.253 | 34.001 | 1.68x |
+| 16 | 16384 | 88.131 | 47.421 | 1.86x | 227.555 | 135.821 | 1.68x |
+| 32 | 256 | 0.381 | 0.324 | 1.18x | 0.770 | 0.506 | 1.52x |
+| 32 | 1024 | 0.632 | 0.502 | 1.26x | 1.523 | 1.186 | 1.28x |
+| 32 | 4096 | 6.252 | 3.706 | 1.69x | 15.894 | 10.069 | 1.58x |
+| 32 | 8192 | 23.261 | 12.645 | 1.84x | 58.021 | 34.976 | 1.66x |
+| 32 | 16384 | 91.603 | 50.863 | 1.80x | 230.990 | 139.290 | 1.66x |
+| 64 | 256 | 0.375 | 0.354 | 1.06x | 0.773 | 0.542 | 1.43x |
+| 64 | 1024 | 0.668 | 0.525 | 1.27x | 1.600 | 1.185 | 1.35x |
+| 64 | 4096 | 6.722 | 4.223 | 1.59x | 16.367 | 10.659 | 1.54x |
+| 64 | 8192 | 25.019 | 14.434 | 1.73x | 59.798 | 36.765 | 1.63x |
+| 64 | 16384 | 98.847 | 58.091 | 1.70x | 238.288 | 146.509 | 1.63x |
+| 128 | 256 | 0.378 | 0.337 | 1.12x | 0.789 | 0.526 | 1.50x |
+| 128 | 1024 | 0.751 | 0.570 | 1.32x | 1.707 | 1.199 | 1.42x |
+| 128 | 4096 | 7.569 | 5.025 | 1.51x | 17.237 | 11.460 | 1.50x |
+| 128 | 8192 | 28.479 | 17.955 | 1.59x | 63.325 | 40.366 | 1.57x |
+| 128 | 16384 | 112.835 | 71.947 | 1.57x | 252.603 | 160.520 | 1.57x |
+
+Deliverable:
+
+> Compilation provides little benefit for the smallest forward workloads, where launch and framework overhead dominate; at `d_k=16`, sequence length 256, compiled forward was slightly slower (`0.96x`). The benefit grows with sequence length because TorchInductor can fuse the elementwise scaling and softmax operations around the matrix multiplications. Across the larger configurations, compiled forward was approximately `1.5-1.9x` faster and compiled backward was approximately `1.5-1.7x` faster than eager execution. All 40 eager/compiled runs completed successfully on the A100 80GB.

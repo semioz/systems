@@ -48,7 +48,7 @@ def main() -> None:
     print(f"running: {' '.join(command)}")
 
     remote_run = make_gpu_function(config)
-    with app.run():
+    with modal.enable_output(), app.run():
         returncode = remote_run.remote(config.script.as_posix(), list(config.script_args))
 
     raise SystemExit(returncode)
