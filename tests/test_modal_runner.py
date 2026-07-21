@@ -49,3 +49,9 @@ def test_build_remote_command_uses_root_script_path() -> None:
         "--device",
         "cuda",
     ]
+
+
+def test_modal_entrypoint_enables_remote_output_streaming() -> None:
+    source = Path("scripts/modal_gpu.py").read_text()
+
+    assert "with modal.enable_output(), app.run():" in source

@@ -404,3 +404,28 @@ Raw output: `torch_compile_attention_results.txt`
 Deliverable:
 
 > Compilation provides little benefit for the smallest forward workloads, where launch and framework overhead dominate; at `d_k=16`, sequence length 256, compiled forward was slightly slower (`0.96x`). The benefit grows with sequence length because TorchInductor can fuse the elementwise scaling and softmax operations around the matrix multiplications. Across the larger configurations, compiled forward was approximately `1.5-1.9x` faster and compiled backward was approximately `1.5-1.7x` faster than eager execution. All 40 eager/compiled runs completed successfully on the A100 80GB.
+
+## 4.2.1 Triton Weighted Sum Notes
+
+Weighted sum multiplies every row of `x` by the same weight vector and reduces the final dimension:
+
+```text
+x: [..., D], weight: [D], output: [...]
+output[row] = sum_d(x[row, d] * weight[d])
+```
+
+`torch.autograd.Function` connects a custom operation to PyTorch autograd. In `WeightedSumFunction.forward`, we allocate the output, launch the Triton `weighted_sum_fwd` kernel, and save the tensors needed later with `ctx.save_for_backward`. When `loss.backward()` reaches this operation, PyTorch calls `WeightedSumFunction.backward`, which launches `weighted_sum_bwd` and returns `grad_x` and `grad_weight`. PyTorch then accumulates these returned tensors into the corresponding inputs' `.grad` fields. Thus, `autograd.Function` does not read Triton results automatically; it is the wrapper that defines how the Triton forward and backward kernels participate in PyTorch's computation graph.
+
+For an operation written entirely from standard PyTorch operations, a custom `autograd.Function` is normally unnecessary because PyTorch already knows the backward rules and constructs the graph automatically. It is useful here because PyTorch cannot inspect the operations inside a custom Triton kernel. Kernel tensor arguments are left without normal Python type annotations because `@triton.jit` converts CUDA tensors to device pointers when the kernel is launched; compile-time tile parameters use the Triton annotation `tl.constexpr`. The `ctx: torch.autograd.function.FunctionCtx` annotation is only a Python type hint for the object used to transfer saved state from forward to backward.
+
+### Weighted Sum GPU Verification
+
+The custom `weighted_sum_fwd` and `weighted_sum_bwd` Triton kernels were compiled and executed on a Modal A100 80GB GPU. The test used FP32 `x` with shape `(32, 64)`, `weight` with shape `(64,)`, and a random output gradient with shape `(32,)`. Forward output and both backward gradients were compared against the equivalent native PyTorch operation.
+
+| result | maximum absolute error |
+|:---|---:|
+| forward output | 0.00000286 |
+| `grad_x` | 0.00000000 |
+| `grad_weight` | 0.00000191 |
+
+The result tensor was on `cuda:0` and had `grad_fn=<WeightedSumFunctionBackward>`, confirming that the Triton forward kernel was connected to PyTorch autograd and that calling `backward()` invoked the custom backward path. The small nonzero differences are expected floating-point effects caused by a different reduction order from the PyTorch reference implementation.
