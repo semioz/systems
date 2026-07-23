@@ -20,6 +20,7 @@ image = (
         "matplotlib",
         "numpy>=2",
         "pandas>=2",
+        "pytest>=8",
         "regex",
         "tqdm",
         "wandb",
@@ -28,6 +29,7 @@ image = (
     .add_local_dir("cs336_systems", "/root/cs336_systems")
     .add_local_dir("cs336-basics/cs336_basics", "/root/cs336_basics")
     .add_local_dir("scripts", "/root/scripts")
+    .add_local_dir("tests", "/root/tests")
 )
 
 
